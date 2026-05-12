@@ -7,6 +7,20 @@
 
 namespace lru {
 
+// Snapshot of cache access counters since construction or last reset_stats().
+struct CacheStats {
+    std::size_t hits      = 0;
+    std::size_t misses    = 0;
+    std::size_t evictions = 0;
+    std::size_t puts      = 0;
+
+    // Fraction of lookups that found a value; 0.0 if no lookups yet.
+    [[nodiscard]] double hit_rate() const noexcept {
+        const auto total = hits + misses;
+        return total == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(total);
+    }
+};
+
 // LRU Cache with O(1) get and put via doubly-linked list + hash map.
 // Key must be hashable, Value must be copy-constructible.
 template <typename Key, typename Value>
@@ -34,16 +48,19 @@ public:
     // Marks the entry as most-recently used on hit.
     [[nodiscard]] std::optional<Value> get(const Key& key) {
         auto it = map_.find(key);
-        if (it == map_.end())
+        if (it == map_.end()) {
+            ++stats_.misses;
             return std::nullopt;
+        }
 
-        // Move accessed entry to the front of the list (most recent)
+        ++stats_.hits;
         order_.splice(order_.begin(), order_, it->second);
         return it->second->second;
     }
 
     // Inserts or updates key/value. Evicts the LRU entry when over capacity.
     void put(const Key& key, Value value) {
+        ++stats_.puts;
         auto it = map_.find(key);
         if (it != map_.end()) {
             it->second->second = std::move(value);
@@ -58,7 +75,7 @@ public:
         map_.emplace(key, order_.begin());
     }
 
-    // Returns true if key is present (does not update recency).
+    // Returns true if key is present (does not update recency or stats).
     [[nodiscard]] bool contains(const Key& key) const {
         return map_.count(key) != 0;
     }
@@ -78,9 +95,15 @@ public:
         map_.clear();
     }
 
-    [[nodiscard]] size_type size()     const noexcept { return map_.size(); }
-    [[nodiscard]] size_type capacity() const noexcept { return capacity_; }
-    [[nodiscard]] bool      empty()    const noexcept { return map_.empty(); }
+    [[nodiscard]] size_type  size()     const noexcept { return map_.size(); }
+    [[nodiscard]] size_type  capacity() const noexcept { return capacity_; }
+    [[nodiscard]] bool       empty()    const noexcept { return map_.empty(); }
+
+    // Returns a snapshot of access statistics accumulated so far.
+    [[nodiscard]] CacheStats stats()    const noexcept { return stats_; }
+
+    // Resets all counters to zero.
+    void reset_stats() noexcept { stats_ = {}; }
 
 private:
     using ListEntry  = std::pair<Key, Value>;
@@ -89,13 +112,15 @@ private:
     using MapType    = std::unordered_map<Key, ListIter>;
 
     void evict() {
+        ++stats_.evictions;
         map_.erase(order_.back().first);
         order_.pop_back();
     }
 
-    size_type capacity_;
-    ListType  order_;   // front = MRU, back = LRU
-    MapType   map_;
+    size_type  capacity_;
+    ListType   order_;   // front = MRU, back = LRU
+    MapType    map_;
+    CacheStats stats_;
 };
 
 } // namespace lru

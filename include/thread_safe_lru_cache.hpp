@@ -63,6 +63,18 @@ public:
         return cache_.empty();
     }
 
+    // Returns a snapshot of access statistics (hits, misses, evictions, puts).
+    [[nodiscard]] CacheStats stats() const {
+        std::shared_lock lock(mutex_);
+        return cache_.stats();
+    }
+
+    // Resets all counters to zero.
+    void reset_stats() {
+        std::unique_lock lock(mutex_);
+        cache_.reset_stats();
+    }
+
 private:
     Cache<Key, Value>        cache_;
     mutable std::shared_mutex mutex_;

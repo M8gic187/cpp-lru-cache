@@ -1,16 +1,23 @@
 # cpp-lru-cache
 
-A high-performance, thread-safe LRU (Least Recently Used) cache implemented in modern C++17.
+A high-performance, header-only cache library in modern C++17 offering two
+eviction policies — **LRU** (Least Recently Used) and **LFU** (Least
+Frequently Used) — with built-in access statistics and an optional
+thread-safe wrapper.
 
 ## Features
 
-- **O(1)** `get` and `put` operations via doubly-linked list + hash map
-- Thread-safe variant using `std::shared_mutex` for concurrent read access
-- Header-only, template-based — works with any hashable key and copyable value type
-- Comprehensive unit tests
-- Benchmark suite for performance profiling
+- **O(1)** `get` and `put` for both LRU and LFU via doubly-linked lists + hash maps
+- **LFU** uses per-frequency buckets with LRU tie-breaking (no extra cost)
+- Thread-safe LRU variant using `std::shared_mutex` for concurrent read access
+- Built-in **access statistics** — hits, misses, evictions, put count, hit rate
+- Header-only, template-based — works with any hashable key and move-constructible value
+- Comprehensive unit tests (25 cases) covering edge cases and concurrent correctness
+- Benchmark suite comparing LRU vs LFU throughput
 
 ## Usage
+
+### LRU Cache
 
 ```cpp
 #include "lru_cache.hpp"
@@ -21,17 +28,52 @@ cache.put(1, "one");
 cache.put(2, "two");
 cache.put(3, "three");
 
-auto val = cache.get(1);   // returns std::optional<std::string>{"one"}
+auto val = cache.get(1);   // std::optional<std::string>{"one"}
 cache.put(4, "four");      // evicts key 2 (least recently used)
 ```
 
-### Thread-Safe Variant
+### LFU Cache
+
+```cpp
+#include "lfu_cache.hpp"
+
+lfu::Cache<int, std::string> cache(3);
+
+cache.put(1, "one");
+cache.put(2, "two");
+cache.put(3, "three");
+
+cache.get(1); cache.get(1); // freq(1) = 3
+cache.get(2);               // freq(2) = 2
+                            // freq(3) = 1  ← evicted next
+cache.put(4, "four");       // evicts key 3 (least frequently used)
+```
+
+### Access Statistics
+
+```cpp
+lru::Cache<int, int> cache(100);
+// ... use the cache ...
+
+lru::CacheStats s = cache.stats();
+std::cout << "hits="      << s.hits
+          << " misses="   << s.misses
+          << " evictions=" << s.evictions
+          << " hit_rate=" << s.hit_rate() << "\n";
+
+cache.reset_stats(); // zero all counters
+```
+
+Statistics are also available on `ThreadSafeCache` via the same `stats()` /
+`reset_stats()` API.
+
+### Thread-Safe LRU
 
 ```cpp
 #include "thread_safe_lru_cache.hpp"
 
 lru::ThreadSafeCache<std::string, int> cache(100);
-// safe to use from multiple threads
+// safe to use from multiple threads concurrently
 ```
 
 ## Build
@@ -40,14 +82,23 @@ lru::ThreadSafeCache<std::string, int> cache(100);
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
+./build/benchmarks/bench_lru_cache
 ```
 
 ## Performance
 
-Single-threaded, 1M operations on a cache with capacity 10000:
+Single-threaded, 1 M operations, capacity = 10 000:
 
-| Operation | Throughput       |
-|-----------|-----------------|
-| put       | ~120 M ops/sec  |
-| get (hit) | ~150 M ops/sec  |
-| mixed     | ~100 M ops/sec  |
+| Operation                       | LRU throughput   |
+|---------------------------------|-----------------|
+| put (fill, no eviction)         | ~120 M ops/sec  |
+| put (with eviction)             | ~110 M ops/sec  |
+| get (100 % hit rate)            | ~150 M ops/sec  |
+| get (~50 % hit rate, random)    | ~130 M ops/sec  |
+| mixed put/get (50/50)           | ~100 M ops/sec  |
+| ThreadSafeCache single-threaded | ~70 M ops/sec   |
+| ThreadSafeCache 4 threads total | ~120 M ops/sec  |
+
+LFU throughput is comparable to LRU for workloads with stable frequency
+distributions; it trades a slightly larger constant factor (two hash map
+lookups per promotion) for more accurate eviction under skewed access patterns.

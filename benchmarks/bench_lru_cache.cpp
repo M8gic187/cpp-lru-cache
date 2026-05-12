@@ -1,3 +1,4 @@
+#include "lfu_cache.hpp"
 #include "lru_cache.hpp"
 #include "thread_safe_lru_cache.hpp"
 
@@ -19,7 +20,7 @@ struct Result {
 };
 
 void print_result(const Result& r) {
-    std::cout << std::left  << std::setw(40) << r.label
+    std::cout << std::left  << std::setw(44) << r.label
               << std::right << std::setw(12) << std::fixed << std::setprecision(2)
               << (r.ops_per_sec / 1e6) << " M ops/sec\n";
 }
@@ -51,24 +52,22 @@ int main() {
     constexpr std::size_t CAPACITY = 10'000;
     constexpr std::size_t N        = 1'000'000;
 
-    std::cout << "LRU Cache Benchmark (capacity=" << CAPACITY
-              << ", N=" << N << ")\n";
-    std::cout << std::string(55, '-') << "\n";
+    std::cout << "Cache Benchmark (capacity=" << CAPACITY << ", N=" << N << ")\n";
+    std::cout << std::string(59, '-') << "\n";
 
-    // --- sequential put (no eviction) ---
+    // ── LRU: sequential put (no eviction) ────────────────────────────────────
     {
         lru::Cache<int, int> c(CAPACITY);
         auto ops = measure([&] {
             for (std::size_t i = 0; i < CAPACITY; ++i)
                 c.put(static_cast<int>(i), static_cast<int>(i));
         }, CAPACITY);
-        print_result({"put (fill, no eviction)", ops});
+        print_result({"LRU put (fill, no eviction)", ops});
     }
 
-    // --- put with eviction ---
+    // ── LRU: put with eviction ────────────────────────────────────────────────
     {
         lru::Cache<int, int> c(CAPACITY);
-        // Pre-fill
         for (std::size_t i = 0; i < CAPACITY; ++i)
             c.put(static_cast<int>(i), static_cast<int>(i));
 
@@ -76,10 +75,10 @@ int main() {
             for (std::size_t i = CAPACITY; i < CAPACITY + N; ++i)
                 c.put(static_cast<int>(i), static_cast<int>(i));
         }, N);
-        print_result({"put (with eviction)", ops});
+        print_result({"LRU put (with eviction)", ops});
     }
 
-    // --- get 100% hit ---
+    // ── LRU: get 100% hit ────────────────────────────────────────────────────
     {
         lru::Cache<int, int> c(CAPACITY);
         for (std::size_t i = 0; i < CAPACITY; ++i)
@@ -93,10 +92,10 @@ int main() {
             }
         }, N);
         (void)sink;
-        print_result({"get (100% hit rate)", ops});
+        print_result({"LRU get (100% hit rate)", ops});
     }
 
-    // --- get 50% hit (random access over 2x capacity) ---
+    // ── LRU: get ~50% hit ────────────────────────────────────────────────────
     {
         lru::Cache<int, int> c(CAPACITY);
         for (std::size_t i = 0; i < CAPACITY; ++i)
@@ -111,10 +110,10 @@ int main() {
             }
         }, N);
         (void)sink;
-        print_result({"get (~50% hit rate, random)", ops});
+        print_result({"LRU get (~50% hit rate, random)", ops});
     }
 
-    // --- mixed put/get ---
+    // ── LRU: mixed put/get ───────────────────────────────────────────────────
     {
         lru::Cache<int, int> c(CAPACITY);
         Rng rng;
@@ -125,10 +124,84 @@ int main() {
                 else             (void)c.get(k);
             }
         }, N);
-        print_result({"mixed put/get (50/50)", ops});
+        print_result({"LRU mixed put/get (50/50)", ops});
     }
 
-    // --- thread-safe: single-threaded overhead ---
+    std::cout << std::string(59, '-') << "\n";
+
+    // ── LFU: sequential put (no eviction) ────────────────────────────────────
+    {
+        lfu::Cache<int, int> c(CAPACITY);
+        auto ops = measure([&] {
+            for (std::size_t i = 0; i < CAPACITY; ++i)
+                c.put(static_cast<int>(i), static_cast<int>(i));
+        }, CAPACITY);
+        print_result({"LFU put (fill, no eviction)", ops});
+    }
+
+    // ── LFU: put with eviction ────────────────────────────────────────────────
+    {
+        lfu::Cache<int, int> c(CAPACITY);
+        for (std::size_t i = 0; i < CAPACITY; ++i)
+            c.put(static_cast<int>(i), static_cast<int>(i));
+
+        auto ops = measure([&] {
+            for (std::size_t i = CAPACITY; i < CAPACITY + N; ++i)
+                c.put(static_cast<int>(i), static_cast<int>(i));
+        }, N);
+        print_result({"LFU put (with eviction)", ops});
+    }
+
+    // ── LFU: get 100% hit ────────────────────────────────────────────────────
+    {
+        lfu::Cache<int, int> c(CAPACITY);
+        for (std::size_t i = 0; i < CAPACITY; ++i)
+            c.put(static_cast<int>(i), static_cast<int>(i));
+
+        volatile int sink = 0;
+        auto ops = measure([&] {
+            for (std::size_t i = 0; i < N; ++i) {
+                auto v = c.get(static_cast<int>(i % CAPACITY));
+                if (v) sink += *v;
+            }
+        }, N);
+        (void)sink;
+        print_result({"LFU get (100% hit rate)", ops});
+    }
+
+    // ── LFU: mixed put/get ───────────────────────────────────────────────────
+    {
+        lfu::Cache<int, int> c(CAPACITY);
+        Rng rng;
+        auto ops = measure([&] {
+            for (std::size_t i = 0; i < N; ++i) {
+                int k = static_cast<int>(rng.next() % (CAPACITY * 2));
+                if (i % 2 == 0) c.put(k, k);
+                else             (void)c.get(k);
+            }
+        }, N);
+        print_result({"LFU mixed put/get (50/50)", ops});
+    }
+
+    std::cout << std::string(59, '-') << "\n";
+
+    // ── LRU stats overhead check ──────────────────────────────────────────────
+    {
+        lru::Cache<int, int> c(CAPACITY);
+        Rng rng;
+        auto ops = measure([&] {
+            for (std::size_t i = 0; i < N; ++i) {
+                int k = static_cast<int>(rng.next() % (CAPACITY * 2));
+                if (i % 2 == 0) c.put(k, k);
+                else             (void)c.get(k);
+            }
+        }, N);
+        const auto s = c.stats();
+        print_result({"LRU mixed w/ stats (" +
+                      std::to_string(static_cast<int>(s.hit_rate() * 100)) + "% hit)", ops});
+    }
+
+    // ── ThreadSafeCache: single-threaded overhead ─────────────────────────────
     {
         lru::ThreadSafeCache<int, int> c(CAPACITY);
         Rng rng;
@@ -142,7 +215,7 @@ int main() {
         print_result({"ThreadSafeCache single-threaded", ops});
     }
 
-    // --- thread-safe: 4-thread concurrent ---
+    // ── ThreadSafeCache: 4-thread concurrent ─────────────────────────────────
     {
         constexpr int THREADS = 4;
         lru::ThreadSafeCache<int, int> c(CAPACITY);
@@ -167,6 +240,6 @@ int main() {
         print_result({"ThreadSafeCache 4 threads (total)", ops});
     }
 
-    std::cout << std::string(55, '-') << "\n";
+    std::cout << std::string(59, '-') << "\n";
     return 0;
 }

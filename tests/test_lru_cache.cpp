@@ -1,8 +1,11 @@
 #include "lfu_cache.hpp"
 #include "lru_cache.hpp"
+#include "thread_safe_lfu_cache.hpp"
 #include "thread_safe_lru_cache.hpp"
+#include "ttl_lru_cache.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -332,6 +335,205 @@ TEST(lfu_contains_no_frequency_change) {
     c.put(3, 3);         // 1 is still at freq=1, evict LRU at freq=1 → 1
     EXPECT(!c.get(1).has_value());
     EXPECT(c.get(2).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// peek() — LRU Cache
+// ---------------------------------------------------------------------------
+
+TEST(lru_peek_returns_value_without_updating_recency) {
+    lru::Cache<int, int> c(2);
+    c.put(1, 10); c.put(2, 20);
+    // peek at 1 — if it updated recency, 2 would be evicted instead of 1
+    EXPECT(c.peek(1).value() == 10);
+    c.put(3, 30); // LRU is still 1 (peek must not promote it)
+    EXPECT(!c.get(1).has_value());
+    EXPECT(c.get(2).has_value());
+    EXPECT(c.get(3).has_value());
+}
+
+TEST(lru_peek_returns_nullopt_for_missing_key) {
+    lru::Cache<int, int> c(3);
+    c.put(1, 1);
+    EXPECT(!c.peek(99).has_value());
+}
+
+TEST(lru_peek_does_not_affect_stats) {
+    lru::Cache<int, int> c(3);
+    c.put(1, 1);
+    (void)c.peek(1);
+    (void)c.peek(99);
+    const auto s = c.stats();
+    EXPECT(s.hits == 0 && s.misses == 0);
+}
+
+// ---------------------------------------------------------------------------
+// peek() — LFU Cache
+// ---------------------------------------------------------------------------
+
+TEST(lfu_peek_returns_value_without_incrementing_frequency) {
+    lfu::Cache<int, int> c(2);
+    c.put(1, 10); c.put(2, 20);
+    // peek at 1 many times — frequency must stay at 1
+    for (int i = 0; i < 5; ++i) EXPECT(c.peek(1).value() == 10);
+    // now 2 is accessed via get (freq=2), and 1 is still at freq=1
+    (void)c.get(2);
+    c.put(3, 30); // evicts 1 (lowest freq=1, peek did not promote it)
+    EXPECT(!c.get(1).has_value());
+    EXPECT(c.get(2).has_value());
+}
+
+TEST(lfu_peek_returns_nullopt_for_missing_key) {
+    lfu::Cache<int, int> c(3);
+    c.put(1, 1);
+    EXPECT(!c.peek(42).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// lfu::ThreadSafeCache — concurrent correctness
+// ---------------------------------------------------------------------------
+
+TEST(thread_safe_lfu_concurrent_puts) {
+    lfu::ThreadSafeCache<int, int> c(1000);
+    constexpr int THREADS = 8;
+    constexpr int OPS     = 200;
+
+    std::vector<std::thread> workers;
+    workers.reserve(THREADS);
+    for (int t = 0; t < THREADS; ++t) {
+        workers.emplace_back([&, t]() {
+            for (int i = 0; i < OPS; ++i)
+                c.put(t * OPS + i, i);
+        });
+    }
+    for (auto& w : workers) w.join();
+    EXPECT(c.size() <= 1000);
+}
+
+TEST(thread_safe_lfu_mixed_reads_writes) {
+    lfu::ThreadSafeCache<int, int> c(100);
+    for (int i = 0; i < 50; ++i) c.put(i, i);
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 4; ++t) {
+        workers.emplace_back([&]() {
+            for (int i = 0; i < 200; ++i) {
+                c.put(i % 120, i);
+                (void)c.get(i % 50);
+                (void)c.contains(i % 100);
+                (void)c.peek(i % 100);
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    EXPECT(c.size() <= 100);
+}
+
+TEST(thread_safe_lfu_peek_does_not_require_write_lock) {
+    lfu::ThreadSafeCache<int, int> c(50);
+    for (int i = 0; i < 50; ++i) c.put(i, i * 2);
+
+    // Concurrent peeks from multiple threads should all succeed
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 8; ++t) {
+        readers.emplace_back([&]() {
+            for (int i = 0; i < 50; ++i)
+                EXPECT(c.peek(i).value() == i * 2);
+        });
+    }
+    for (auto& r : readers) r.join();
+}
+
+// ---------------------------------------------------------------------------
+// lru::TtlCache — TTL-based expiry
+// ---------------------------------------------------------------------------
+
+TEST(ttl_cache_basic_put_and_get) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, std::string> c(4, ms{500});
+    c.put(1, "one");
+    c.put(2, "two");
+    EXPECT(c.get(1).value() == "one");
+    EXPECT(c.get(2).value() == "two");
+    EXPECT(!c.get(99).has_value());
+    EXPECT(c.size() == 2);
+}
+
+TEST(ttl_cache_zero_capacity_throws) {
+    using ms = std::chrono::milliseconds;
+    bool threw = false;
+    try { lru::TtlCache<int, int> c(0, ms{100}); }
+    catch (const std::invalid_argument&) { threw = true; }
+    EXPECT(threw);
+}
+
+TEST(ttl_cache_expired_entry_removed_on_get) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(4, ms{30});
+    c.put(1, 42);
+    std::this_thread::sleep_for(ms{50}); // let entry expire
+    EXPECT(!c.get(1).has_value());
+    EXPECT(c.size() == 0); // lazily removed
+}
+
+TEST(ttl_cache_expired_entry_not_visible_via_contains) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(4, ms{30});
+    c.put(1, 42);
+    std::this_thread::sleep_for(ms{50});
+    EXPECT(!c.contains(1));
+}
+
+TEST(ttl_cache_non_expired_entry_survives) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(4, ms{300});
+    c.put(1, 99);
+    std::this_thread::sleep_for(ms{20}); // well within TTL
+    EXPECT(c.get(1).value() == 99);
+}
+
+TEST(ttl_cache_lru_eviction_when_full) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(2, ms{500});
+    c.put(1, 1); c.put(2, 2);
+    (void)c.get(1); // promote 1 → LRU is now 2
+    c.put(3, 3);    // evicts 2
+    EXPECT(!c.get(2).has_value());
+    EXPECT(c.get(1).has_value());
+    EXPECT(c.get(3).has_value());
+}
+
+TEST(ttl_cache_custom_ttl_per_entry) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(4, ms{500});
+    c.put(1, 10, ms{30});  // short TTL
+    c.put(2, 20, ms{500}); // long TTL
+    std::this_thread::sleep_for(ms{60});
+    EXPECT(!c.get(1).has_value()); // expired
+    EXPECT(c.get(2).value() == 20); // still alive
+}
+
+TEST(ttl_cache_purge_expired) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(6, ms{500});
+    c.put(1, 1, ms{30});
+    c.put(2, 2, ms{30});
+    c.put(3, 3, ms{500}); // survives
+    std::this_thread::sleep_for(ms{60});
+    const std::size_t removed = c.purge_expired();
+    EXPECT(removed == 2);
+    EXPECT(c.size() == 1);
+    EXPECT(c.get(3).has_value());
+}
+
+TEST(ttl_cache_update_refreshes_expiry) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(4, ms{500});
+    c.put(1, 10, ms{30}); // will expire soon
+    std::this_thread::sleep_for(ms{15});
+    c.put(1, 20, ms{500}); // refresh value and TTL
+    std::this_thread::sleep_for(ms{30}); // original TTL would have expired here
+    EXPECT(c.get(1).value() == 20); // refreshed entry still alive
 }
 
 // ---------------------------------------------------------------------------

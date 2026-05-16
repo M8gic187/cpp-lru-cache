@@ -75,6 +75,16 @@ public:
         map_.emplace(key, order_.begin());
     }
 
+    // Returns the value for key without updating recency or access statistics.
+    // Use this when you need to inspect a cached value but must not affect
+    // the eviction order (e.g. monitoring, serialisation, read-only probes).
+    [[nodiscard]] std::optional<Value> peek(const Key& key) const {
+        auto it = map_.find(key);
+        if (it == map_.end())
+            return std::nullopt;
+        return it->second->second;
+    }
+
     // Returns true if key is present (does not update recency or stats).
     [[nodiscard]] bool contains(const Key& key) const {
         return map_.count(key) != 0;

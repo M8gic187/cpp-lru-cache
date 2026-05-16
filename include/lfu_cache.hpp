@@ -66,6 +66,15 @@ public:
         min_freq_ = 1;
     }
 
+    // Returns the value for key without incrementing its frequency.
+    // Useful for read-only inspection that must not affect eviction priority.
+    [[nodiscard]] std::optional<Value> peek(const Key& key) const {
+        auto it = key_map_.find(key);
+        if (it == key_map_.end())
+            return std::nullopt;
+        return it->second.value;
+    }
+
     // Returns true if key is present (does not update frequency).
     [[nodiscard]] bool contains(const Key& key) const {
         return key_map_.count(key) != 0;

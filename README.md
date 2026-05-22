@@ -9,10 +9,14 @@ thread-safe wrapper.
 
 - **O(1)** `get` and `put` for both LRU and LFU via doubly-linked lists + hash maps
 - **LFU** uses per-frequency buckets with LRU tie-breaking (no extra cost)
-- Thread-safe LRU variant using `std::shared_mutex` for concurrent read access
-- Built-in **access statistics** — hits, misses, evictions, put count, hit rate
+- **Thread-safe** wrappers for LRU and LFU using `std::shared_mutex`
+- **`get_or_set(key, factory)`** — atomically returns a cached value or calls a factory to insert it; factory invoked at most once, even under concurrency
+- **`resize(n)`** — dynamically adjusts LRU cache capacity; LRU entries are evicted when shrinking
+- **`peek(key)`** — non-mutating lookup that does not update recency or statistics
+- **Built-in access statistics** — hits, misses, LRU evictions, TTL expirations, put count, hit rate; separate expiration counter on `TtlCache`
+- **`TtlCache`** — LRU cache with per-entry TTL; lazy expiry on access, eager `purge_expired()`, full stats API
 - Header-only, template-based — works with any hashable key and move-constructible value
-- Comprehensive unit tests (25 cases) covering edge cases and concurrent correctness
+- Comprehensive unit tests (66 cases) covering edge cases and concurrent correctness
 - Benchmark suite comparing LRU vs LFU throughput
 
 ## Usage
@@ -49,6 +53,31 @@ cache.get(2);               // freq(2) = 2
 cache.put(4, "four");       // evicts key 3 (least frequently used)
 ```
 
+### get_or_set — atomic read-or-insert
+
+```cpp
+lru::Cache<std::string, Config> cache(256);
+
+// Returns cached config if present; loads from disk and caches it if not.
+// The loader lambda is called at most once per missing key.
+Config cfg = cache.get_or_set("service.json", []() {
+    return load_config_from_disk("service.json");
+});
+```
+
+Works on `lru::Cache`, `lfu::Cache`, and both thread-safe wrappers. The
+thread-safe variants hold the exclusive lock across the entire lookup+insert
+so the factory is never called twice for the same key under concurrency.
+
+### resize — dynamic capacity adjustment
+
+```cpp
+lru::Cache<int, int> cache(100);
+// ... workload changes ...
+cache.resize(50);  // evicts 50 LRU entries, updates capacity
+cache.resize(200); // just raises the ceiling, no evictions
+```
+
 ### Access Statistics
 
 ```cpp
@@ -56,16 +85,17 @@ lru::Cache<int, int> cache(100);
 // ... use the cache ...
 
 lru::CacheStats s = cache.stats();
-std::cout << "hits="      << s.hits
-          << " misses="   << s.misses
-          << " evictions=" << s.evictions
-          << " hit_rate=" << s.hit_rate() << "\n";
+std::cout << "hits="        << s.hits
+          << " misses="     << s.misses
+          << " evictions="  << s.evictions   // LRU capacity evictions
+          << " expirations="<< s.expirations // TTL expirations (TtlCache)
+          << " hit_rate="   << s.hit_rate() << "\n";
 
 cache.reset_stats(); // zero all counters
 ```
 
-Statistics are also available on `ThreadSafeCache` via the same `stats()` /
-`reset_stats()` API.
+Statistics are also available on `ThreadSafeCache` and `TtlCache` via the
+same `stats()` / `reset_stats()` API.
 
 ### Thread-Safe LRU
 

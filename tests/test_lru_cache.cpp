@@ -537,6 +537,225 @@ TEST(ttl_cache_update_refreshes_expiry) {
 }
 
 // ---------------------------------------------------------------------------
+// get_or_set — lru::Cache
+// ---------------------------------------------------------------------------
+
+TEST(lru_get_or_set_hit_returns_cached_value) {
+    lru::Cache<int, int> c(4);
+    c.put(1, 42);
+    int calls = 0;
+    auto val = c.get_or_set(1, [&]{ ++calls; return 99; });
+    EXPECT(val == 42);
+    EXPECT(calls == 0); // factory must NOT be called on a hit
+}
+
+TEST(lru_get_or_set_miss_inserts_factory_result) {
+    lru::Cache<int, int> c(4);
+    int calls = 0;
+    auto val = c.get_or_set(7, [&]{ ++calls; return 77; });
+    EXPECT(val == 77);
+    EXPECT(calls == 1);
+    EXPECT(c.get(7).value() == 77); // value was cached
+}
+
+TEST(lru_get_or_set_tracks_stats) {
+    lru::Cache<int, int> c(4);
+    c.put(1, 10);
+    c.get_or_set(1, []{ return 0; }); // hit
+    c.get_or_set(2, []{ return 20; }); // miss + put
+    const auto s = c.stats();
+    EXPECT(s.hits   == 1);
+    EXPECT(s.misses == 1);
+    EXPECT(s.puts   == 2); // initial put + get_or_set miss
+}
+
+TEST(lru_get_or_set_evicts_lru_when_full) {
+    lru::Cache<int, int> c(2);
+    c.put(1, 1); c.put(2, 2);
+    // key 1 is LRU; inserting 3 via get_or_set should evict 1
+    c.get_or_set(3, []{ return 3; });
+    EXPECT(!c.get(1).has_value());
+    EXPECT(c.get(2).has_value());
+    EXPECT(c.get(3).value() == 3);
+}
+
+// ---------------------------------------------------------------------------
+// get_or_set — lfu::Cache
+// ---------------------------------------------------------------------------
+
+TEST(lfu_get_or_set_hit_promotes_frequency) {
+    lfu::Cache<int, int> c(3);
+    c.put(1, 10); c.put(2, 20); c.put(3, 30);
+    // promote key 1 twice via get_or_set
+    c.get_or_set(1, []{ return 0; });
+    c.get_or_set(1, []{ return 0; });
+    // 1 now has freq=3, 2 and 3 have freq=1
+    c.put(4, 40); // evicts LFU (2 or 3, not 1)
+    EXPECT(c.get(1).has_value());
+}
+
+TEST(lfu_get_or_set_miss_caches_result) {
+    lfu::Cache<int, int> c(3);
+    int calls = 0;
+    auto v = c.get_or_set(5, [&]{ ++calls; return 55; });
+    EXPECT(v == 55);
+    EXPECT(calls == 1);
+    EXPECT(c.get(5).value() == 55);
+}
+
+// ---------------------------------------------------------------------------
+// resize — lru::Cache
+// ---------------------------------------------------------------------------
+
+TEST(lru_resize_grow_accepts_more_entries) {
+    lru::Cache<int, int> c(2);
+    c.put(1, 1); c.put(2, 2);
+    c.resize(4);
+    EXPECT(c.capacity() == 4);
+    c.put(3, 3); c.put(4, 4);
+    EXPECT(c.size() == 4);
+    EXPECT(c.get(1).has_value());
+}
+
+TEST(lru_resize_shrink_evicts_lru_entries) {
+    lru::Cache<int, int> c(4);
+    c.put(1, 1); c.put(2, 2); c.put(3, 3); c.put(4, 4);
+    // Access 3 and 4 to make 1 and 2 the LRU entries
+    (void)c.get(3); (void)c.get(4);
+    c.resize(2); // evicts 1 and 2 (LRU)
+    EXPECT(c.size() == 2);
+    EXPECT(c.capacity() == 2);
+    EXPECT(!c.get(1).has_value());
+    EXPECT(!c.get(2).has_value());
+    EXPECT(c.get(3).has_value());
+    EXPECT(c.get(4).has_value());
+}
+
+TEST(lru_resize_shrink_updates_eviction_stats) {
+    lru::Cache<int, int> c(4);
+    c.put(1, 1); c.put(2, 2); c.put(3, 3);
+    c.reset_stats();
+    c.resize(1); // must evict 2 entries
+    EXPECT(c.stats().evictions == 2);
+}
+
+TEST(lru_resize_to_zero_throws) {
+    lru::Cache<int, int> c(4);
+    bool threw = false;
+    try { c.resize(0); } catch (const std::invalid_argument&) { threw = true; }
+    EXPECT(threw);
+}
+
+TEST(lru_resize_same_capacity_is_noop) {
+    lru::Cache<int, int> c(3);
+    c.put(1, 1); c.put(2, 2);
+    c.resize(3);
+    EXPECT(c.size() == 2);
+    EXPECT(c.capacity() == 3);
+}
+
+// ---------------------------------------------------------------------------
+// TtlCache — statistics and peek()
+// ---------------------------------------------------------------------------
+
+TEST(ttl_cache_stats_initial_zero) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(4, ms{500});
+    const auto s = c.stats();
+    EXPECT(s.hits == 0 && s.misses == 0 && s.puts == 0);
+    EXPECT(s.evictions == 0 && s.expirations == 0);
+    EXPECT(s.hit_rate() == 0.0);
+}
+
+TEST(ttl_cache_stats_tracks_hits_and_misses) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(4, ms{500});
+    c.put(1, 10);
+    (void)c.get(1);  // hit
+    (void)c.get(99); // miss (key absent)
+    const auto s = c.stats();
+    EXPECT(s.hits   == 1);
+    EXPECT(s.misses == 1);
+    EXPECT(s.puts   == 1);
+}
+
+TEST(ttl_cache_stats_counts_expirations_on_get) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(4, ms{30});
+    c.put(1, 42);
+    std::this_thread::sleep_for(ms{60});
+    (void)c.get(1); // expired → miss + expiration
+    const auto s = c.stats();
+    EXPECT(s.misses      == 1);
+    EXPECT(s.expirations == 1);
+    EXPECT(s.hits        == 0);
+}
+
+TEST(ttl_cache_stats_counts_expirations_via_purge) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(6, ms{500});
+    c.put(1, 1, ms{20});
+    c.put(2, 2, ms{20});
+    c.put(3, 3, ms{500});
+    c.reset_stats();
+    std::this_thread::sleep_for(ms{50});
+    c.purge_expired();
+    EXPECT(c.stats().expirations == 2);
+}
+
+TEST(ttl_cache_stats_counts_lru_evictions) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(2, ms{500});
+    c.put(1, 1); c.put(2, 2);
+    c.reset_stats();
+    c.put(3, 3); // evicts LRU entry (key 1)
+    EXPECT(c.stats().evictions   == 1);
+    EXPECT(c.stats().expirations == 0);
+}
+
+TEST(ttl_cache_stats_reset) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(4, ms{500});
+    c.put(1, 1);
+    (void)c.get(1);
+    (void)c.get(99);
+    c.reset_stats();
+    const auto s = c.stats();
+    EXPECT(s.hits == 0 && s.misses == 0 && s.puts == 0 && s.expirations == 0);
+}
+
+TEST(ttl_cache_peek_returns_value_without_side_effects) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(2, ms{500});
+    c.put(1, 10); c.put(2, 20);
+    // peek at 1; if it updated recency, 2 would be evicted instead
+    EXPECT(c.peek(1).value() == 10);
+    c.put(3, 30); // LRU is still 1 → evicted
+    EXPECT(!c.get(1).has_value());
+    EXPECT(c.get(2).has_value());
+}
+
+TEST(ttl_cache_peek_returns_nullopt_for_expired_entry) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(4, ms{30});
+    c.put(1, 99);
+    std::this_thread::sleep_for(ms{60});
+    EXPECT(!c.peek(1).has_value()); // expired
+    EXPECT(c.size() == 1);         // peek must NOT remove the entry
+}
+
+TEST(ttl_cache_peek_does_not_affect_stats) {
+    using ms = std::chrono::milliseconds;
+    lru::TtlCache<int, int> c(4, ms{500});
+    c.put(1, 1);
+    c.reset_stats();
+    (void)c.peek(1);
+    (void)c.peek(99);
+    const auto s = c.stats();
+    EXPECT(s.hits == 0 && s.misses == 0);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 

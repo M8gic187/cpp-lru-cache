@@ -41,6 +41,12 @@ public:
         return cache_.get_or_set(key, std::forward<Factory>(factory));
     }
 
+    // Adjusts cache capacity, evicting LRU entries if new_capacity < size().
+    void resize(size_type new_capacity) {
+        std::unique_lock lock(mutex_);
+        cache_.resize(new_capacity);
+    }
+
     // contains does not change internal order — shared lock is sufficient.
     [[nodiscard]] bool contains(const Key& key) const {
         std::shared_lock lock(mutex_);
@@ -62,7 +68,8 @@ public:
         return cache_.size();
     }
 
-    [[nodiscard]] size_type capacity() const noexcept {
+    [[nodiscard]] size_type capacity() const {
+        std::shared_lock lock(mutex_);
         return cache_.capacity();
     }
 

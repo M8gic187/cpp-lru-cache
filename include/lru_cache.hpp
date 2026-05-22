@@ -127,6 +127,17 @@ public:
         map_.clear();
     }
 
+    // Adjusts capacity to new_capacity. If new_capacity < size(), LRU entries
+    // are evicted (with eviction stats updated) until the size fits.
+    void resize(size_type new_capacity) {
+        if (new_capacity == 0)
+            throw std::invalid_argument("Cache capacity must be greater than zero");
+        while (map_.size() > new_capacity)
+            evict();
+        capacity_ = new_capacity;
+        map_.reserve(new_capacity);
+    }
+
     [[nodiscard]] size_type  size()     const noexcept { return map_.size(); }
     [[nodiscard]] size_type  capacity() const noexcept { return capacity_; }
     [[nodiscard]] bool       empty()    const noexcept { return map_.empty(); }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <list>
 #include <optional>
 #include <stdexcept>
@@ -56,6 +57,27 @@ public:
         ++stats_.hits;
         order_.splice(order_.begin(), order_, it->second);
         return it->second->second;
+    }
+
+    // Returns the cached value for key if present; otherwise calls factory(),
+    // stores the produced value, and returns it. The factory is invoked at most once.
+    // A hit increments stats.hits; a miss increments stats.misses and stats.puts.
+    template <typename Factory>
+    Value get_or_set(const Key& key, Factory&& factory) {
+        auto it = map_.find(key);
+        if (it != map_.end()) {
+            ++stats_.hits;
+            order_.splice(order_.begin(), order_, it->second);
+            return it->second->second;
+        }
+        ++stats_.misses;
+        Value val = std::invoke(std::forward<Factory>(factory));
+        ++stats_.puts;
+        if (map_.size() == capacity_)
+            evict();
+        order_.emplace_front(key, val);
+        map_.emplace(key, order_.begin());
+        return val;
     }
 
     // Inserts or updates key/value. Evicts the LRU entry when over capacity.

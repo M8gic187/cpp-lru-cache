@@ -38,6 +38,13 @@ public:
         cache_.put(key, std::move(value));
     }
 
+    // Thread-safe get_or_set: holds the exclusive lock for the full lookup+insert.
+    template <typename Factory>
+    Value get_or_set(const Key& key, Factory&& factory) {
+        std::unique_lock lock(mutex_);
+        return cache_.get_or_set(key, std::forward<Factory>(factory));
+    }
+
     // peek() is read-only — shared lock is sufficient.
     [[nodiscard]] std::optional<Value> peek(const Key& key) const {
         std::shared_lock lock(mutex_);

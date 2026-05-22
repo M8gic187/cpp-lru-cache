@@ -33,6 +33,14 @@ public:
         cache_.put(key, std::move(value));
     }
 
+    // Thread-safe get_or_set: holds the exclusive lock for the full lookup+insert.
+    // Prevents duplicate factory invocations under concurrent access for the same key.
+    template <typename Factory>
+    Value get_or_set(const Key& key, Factory&& factory) {
+        std::unique_lock lock(mutex_);
+        return cache_.get_or_set(key, std::forward<Factory>(factory));
+    }
+
     // contains does not change internal order — shared lock is sufficient.
     [[nodiscard]] bool contains(const Key& key) const {
         std::shared_lock lock(mutex_);

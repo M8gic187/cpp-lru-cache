@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <list>
 #include <optional>
 #include <stdexcept>
@@ -46,6 +47,24 @@ public:
 
         promote(it);
         return it->second.value;
+    }
+
+    // Returns the cached value for key if present (incrementing its frequency);
+    // otherwise calls factory(), stores the result with frequency=1, and returns it.
+    template <typename Factory>
+    Value get_or_set(const Key& key, Factory&& factory) {
+        auto it = key_map_.find(key);
+        if (it != key_map_.end()) {
+            promote(it);
+            return it->second.value;
+        }
+        Value val = std::invoke(std::forward<Factory>(factory));
+        if (key_map_.size() == capacity_)
+            evict();
+        freq_map_[1].emplace_front(key);
+        key_map_.emplace(key, Entry{val, 1, freq_map_[1].begin()});
+        min_freq_ = 1;
+        return val;
     }
 
     // Inserts or updates key/value. On update, the frequency is incremented.

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "lru_cache.hpp"
+
 #include <chrono>
 #include <list>
 #include <optional>
@@ -8,12 +10,16 @@
 
 namespace lru {
 
-// LRU cache with per-entry TTL (Time-To-Live).
+// LRU cache with per-entry TTL (Time-To-Live) and access statistics.
 //
 // Every entry carries an expiry time point derived from the TTL supplied at
 // put() time (or the default_ttl set at construction). Expired entries are
 // treated as absent: get() and contains() remove them lazily on access.
 // purge_expired() allows eager bulk removal of stale entries.
+//
+// Statistics distinguish LRU evictions (capacity pressure) from TTL
+// expirations (age-based removal) so callers can tune both dimensions
+// independently.
 //
 // Eviction policy: standard LRU order among non-expired entries.
 // All operations remain O(1) amortised; expiry checks are a single clock
@@ -50,19 +56,35 @@ public:
     TtlCache& operator=(TtlCache&&)      = default;
 
     // Returns the value for key if it exists and has not expired.
-    // An expired entry is removed lazily before returning nullopt.
-    // Marks a live entry as most-recently used.
+    // An expired entry is removed lazily (incrementing expirations) before
+    // returning nullopt. Marks a live entry as most-recently used.
     [[nodiscard]] std::optional<Value> get(const Key& key) {
         auto it = map_.find(key);
-        if (it == map_.end())
+        if (it == map_.end()) {
+            ++stats_.misses;
             return std::nullopt;
+        }
 
         if (is_expired(it->second)) {
+            ++stats_.misses;
+            ++stats_.expirations;
             remove(it);
             return std::nullopt;
         }
 
+        ++stats_.hits;
         order_.splice(order_.begin(), order_, it->second.list_it);
+        return it->second.value;
+    }
+
+    // Returns the value for key without updating recency or access statistics,
+    // or nullopt if the key is absent or has expired (without removing it).
+    [[nodiscard]] std::optional<Value> peek(const Key& key) const {
+        auto it = map_.find(key);
+        if (it == map_.end())
+            return std::nullopt;
+        if (clock_type::now() >= it->second.expiry)
+            return std::nullopt;
         return it->second.value;
     }
 
@@ -74,6 +96,7 @@ public:
     // Inserts or updates key/value with a custom TTL.
     // An existing entry's expiry and value are both replaced.
     void put(const Key& key, Value value, Duration ttl) {
+        ++stats_.puts;
         auto it = map_.find(key);
         if (it != map_.end()) {
             it->second.value  = std::move(value);
@@ -98,6 +121,7 @@ public:
         if (it == map_.end())
             return false;
         if (is_expired(it->second)) {
+            ++stats_.expirations;
             remove(it);
             return false;
         }
@@ -114,8 +138,8 @@ public:
     }
 
     // Scans all entries and removes those whose TTL has elapsed.
-    // Returns the number of entries removed.
-    // Useful for periodic housekeeping to reclaim capacity proactively.
+    // Returns the number of entries removed. Increments stats.expirations
+    // for each removed entry.
     std::size_t purge_expired() {
         std::size_t count = 0;
         auto it = map_.begin();
@@ -124,6 +148,7 @@ public:
                 order_.erase(it->second.list_it);
                 it = map_.erase(it);
                 ++count;
+                ++stats_.expirations;
             } else {
                 ++it;
             }
@@ -140,6 +165,13 @@ public:
     [[nodiscard]] size_type  capacity()    const noexcept { return capacity_; }
     [[nodiscard]] bool       empty()       const noexcept { return map_.empty(); }
     [[nodiscard]] Duration   default_ttl() const noexcept { return default_ttl_; }
+
+    // Returns a snapshot of access statistics accumulated since construction
+    // or the last reset_stats() call.
+    [[nodiscard]] CacheStats stats()       const noexcept { return stats_; }
+
+    // Resets all counters to zero.
+    void reset_stats() noexcept { stats_ = {}; }
 
 private:
     using ListType = std::list<Key>;
@@ -164,15 +196,17 @@ private:
 
     // Evict the LRU entry (the entry at the back of order_).
     void evict_lru() {
+        ++stats_.evictions;
         const Key& lru_key = order_.back();
         map_.erase(lru_key);
         order_.pop_back();
     }
 
-    size_type capacity_;
-    Duration  default_ttl_;
-    ListType  order_;   // front = MRU, back = LRU
-    MapType   map_;
+    size_type  capacity_;
+    Duration   default_ttl_;
+    ListType   order_;    // front = MRU, back = LRU
+    MapType    map_;
+    CacheStats stats_;
 };
 
 } // namespace lru

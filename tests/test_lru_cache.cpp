@@ -756,11 +756,133 @@ TEST(ttl_cache_peek_does_not_affect_stats) {
 }
 
 // ---------------------------------------------------------------------------
+// lfu::Cache — CacheStats tracking
+// ---------------------------------------------------------------------------
+
+TEST(lfu_stats_initial_zero) {
+    lfu::Cache<int, int> c(4);
+    const auto s = c.stats();
+    EXPECT(s.hits      == 0);
+    EXPECT(s.misses    == 0);
+    EXPECT(s.evictions == 0);
+    EXPECT(s.puts      == 0);
+    EXPECT(s.hit_rate() == 0.0);
+}
+
+TEST(lfu_stats_tracks_hits_and_misses) {
+    lfu::Cache<int, int> c(4);
+    c.put(1, 10); c.put(2, 20);
+    (void)c.get(1);   // hit
+    (void)c.get(2);   // hit
+    (void)c.get(99);  // miss
+    const auto s = c.stats();
+    EXPECT(s.hits   == 2);
+    EXPECT(s.misses == 1);
+}
+
+TEST(lfu_stats_hit_rate_calculation) {
+    lfu::Cache<int, int> c(4);
+    c.put(1, 1);
+    (void)c.get(1); // hit
+    (void)c.get(1); // hit
+    (void)c.get(2); // miss
+    const auto s = c.stats();
+    EXPECT(s.hit_rate() > 0.66 && s.hit_rate() < 0.67);
+}
+
+TEST(lfu_stats_counts_evictions) {
+    lfu::Cache<int, int> c(2);
+    c.put(1, 1); c.put(2, 2);
+    c.put(3, 3); // evicts LFU (key 1, freq=1)
+    c.put(4, 4); // evicts LFU (key 2 or 3, freq=1)
+    EXPECT(c.stats().evictions == 2);
+}
+
+TEST(lfu_stats_counts_puts) {
+    lfu::Cache<int, int> c(4);
+    c.put(1, 1); c.put(2, 2); c.put(1, 99); // update also counts as a put
+    EXPECT(c.stats().puts == 3);
+}
+
+TEST(lfu_stats_reset) {
+    lfu::Cache<int, int> c(4);
+    c.put(1, 1);
+    (void)c.get(1);
+    (void)c.get(99);
+    c.reset_stats();
+    const auto s = c.stats();
+    EXPECT(s.hits == 0 && s.misses == 0 && s.puts == 0 && s.evictions == 0);
+}
+
+TEST(lfu_stats_get_or_set_tracking) {
+    lfu::Cache<int, int> c(4);
+    c.put(1, 10);
+    c.get_or_set(1, []{ return 0; }); // hit
+    c.get_or_set(2, []{ return 20; }); // miss + put
+    const auto s = c.stats();
+    EXPECT(s.hits   == 1);
+    EXPECT(s.misses == 1);
+    EXPECT(s.puts   == 2); // initial put + get_or_set miss
+}
+
+// ---------------------------------------------------------------------------
+// lfu::Cache — resize()
+// ---------------------------------------------------------------------------
+
+TEST(lfu_resize_grow_accepts_more_entries) {
+    lfu::Cache<int, int> c(2);
+    c.put(1, 1); c.put(2, 2);
+    c.resize(4);
+    EXPECT(c.capacity() == 4);
+    c.put(3, 3); c.put(4, 4);
+    EXPECT(c.size() == 4);
+    EXPECT(c.get(1).has_value());
+}
+
+TEST(lfu_resize_shrink_evicts_lfu_entries) {
+    lfu::Cache<int, int> c(4);
+    c.put(1, 1); c.put(2, 2); c.put(3, 3); c.put(4, 4);
+    // Access 3 and 4 to give them higher frequency
+    (void)c.get(3); (void)c.get(3);
+    (void)c.get(4); (void)c.get(4);
+    c.resize(2); // evicts LFU entries (1 and 2 with freq=1)
+    EXPECT(c.size() == 2);
+    EXPECT(c.capacity() == 2);
+    EXPECT(!c.get(1).has_value());
+    EXPECT(!c.get(2).has_value());
+    EXPECT(c.get(3).has_value());
+    EXPECT(c.get(4).has_value());
+}
+
+TEST(lfu_resize_shrink_updates_eviction_stats) {
+    lfu::Cache<int, int> c(4);
+    c.put(1, 1); c.put(2, 2); c.put(3, 3);
+    c.reset_stats();
+    c.resize(1); // must evict 2 entries
+    EXPECT(c.stats().evictions == 2);
+}
+
+TEST(lfu_resize_to_zero_throws) {
+    lfu::Cache<int, int> c(4);
+    bool threw = false;
+    try { c.resize(0); } catch (const std::invalid_argument&) { threw = true; }
+    EXPECT(threw);
+}
+
+TEST(lfu_resize_same_capacity_is_noop) {
+    lfu::Cache<int, int> c(3);
+    c.put(1, 1); c.put(2, 2);
+    c.resize(3);
+    EXPECT(c.size() == 2);
+    EXPECT(c.capacity() == 3);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
 int main() {
-    std::cout << "Running LRU Cache tests...\n";
+    std::cout << "Running LRU/LFU Cache tests...\n";
     std::cout << "\n--- Cache<K,V> ---\n";
 
     std::cout << "\nResults: " << tests_passed << "/" << tests_run << " passed\n";

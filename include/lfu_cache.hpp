@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cache_stats.hpp"
+
 #include <functional>
 #include <list>
 #include <optional>
@@ -8,7 +10,7 @@
 
 namespace lfu {
 
-// O(1) LFU (Least Frequently Used) cache with LRU tie-breaking.
+// O(1) LFU (Least Frequently Used) cache with LRU tie-breaking and access statistics.
 //
 // Evicts the entry with the lowest access frequency. Among entries that share
 // the minimum frequency, the least recently used one is chosen (LRU fallback).
@@ -18,7 +20,7 @@ namespace lfu {
 //   freq_map_ : freq -> list<Key>  (front = MRU, back = LRU within freq)
 //   min_freq_ : tracks the current minimum frequency for O(1) eviction.
 //
-// All operations (get, put, erase) are O(1) amortised.
+// All operations (get, put, erase, resize) are O(1) amortised.
 // Key must be hashable; Value must be move-constructible.
 template <typename Key, typename Value>
 class Cache {
@@ -42,9 +44,12 @@ public:
     // Increments the access frequency of the entry on hit.
     [[nodiscard]] std::optional<Value> get(const Key& key) {
         auto it = key_map_.find(key);
-        if (it == key_map_.end())
+        if (it == key_map_.end()) {
+            ++stats_.misses;
             return std::nullopt;
+        }
 
+        ++stats_.hits;
         promote(it);
         return it->second.value;
     }
@@ -55,10 +60,13 @@ public:
     Value get_or_set(const Key& key, Factory&& factory) {
         auto it = key_map_.find(key);
         if (it != key_map_.end()) {
+            ++stats_.hits;
             promote(it);
             return it->second.value;
         }
+        ++stats_.misses;
         Value val = std::invoke(std::forward<Factory>(factory));
+        ++stats_.puts;
         if (key_map_.size() == capacity_)
             evict();
         freq_map_[1].emplace_front(key);
@@ -70,6 +78,7 @@ public:
     // Inserts or updates key/value. On update, the frequency is incremented.
     // Evicts the LFU/LRU entry when the cache is at capacity.
     void put(const Key& key, Value value) {
+        ++stats_.puts;
         auto it = key_map_.find(key);
         if (it != key_map_.end()) {
             it->second.value = std::move(value);
@@ -116,9 +125,25 @@ public:
         min_freq_ = 0;
     }
 
-    [[nodiscard]] size_type size()     const noexcept { return key_map_.size(); }
-    [[nodiscard]] size_type capacity() const noexcept { return capacity_; }
-    [[nodiscard]] bool      empty()    const noexcept { return key_map_.empty(); }
+    // Adjusts capacity to new_capacity. If new_capacity < size(), the LFU entries
+    // are evicted (with eviction stats updated) until the size fits.
+    void resize(size_type new_capacity) {
+        if (new_capacity == 0)
+            throw std::invalid_argument("Cache capacity must be greater than zero");
+        while (key_map_.size() > new_capacity)
+            evict();
+        capacity_ = new_capacity;
+    }
+
+    [[nodiscard]] size_type      size()       const noexcept { return key_map_.size(); }
+    [[nodiscard]] size_type      capacity()   const noexcept { return capacity_; }
+    [[nodiscard]] bool           empty()      const noexcept { return key_map_.empty(); }
+
+    // Returns a snapshot of access statistics accumulated so far.
+    [[nodiscard]] lru::CacheStats stats()     const noexcept { return stats_; }
+
+    // Resets all counters to zero.
+    void reset_stats() noexcept { stats_ = {}; }
 
 private:
     using FreqList   = std::list<Key>;
@@ -150,13 +175,14 @@ private:
 
     // Evict the LRU entry from the minimum-frequency bucket.
     void evict() {
-        auto& lru_list = freq_map_[min_freq_];
+        ++stats_.evictions;
+        auto& lru_list     = freq_map_[min_freq_];
         const Key& lru_key = lru_list.back();
         key_map_.erase(lru_key);
         lru_list.pop_back();
         if (lru_list.empty())
             freq_map_.erase(min_freq_);
-        // min_freq_ is reset to 1 by the caller (put always inserts with freq=1).
+        // min_freq_ is reset to 1 by the caller (put/get_or_set always insert with freq=1).
     }
 
     // Remove a key from its frequency list; erase the bucket if now empty.
@@ -167,10 +193,11 @@ private:
             freq_map_.erase(freq);
     }
 
-    size_type capacity_;
-    freq_type min_freq_ = 0;
-    KeyMap    key_map_;
-    FreqMap   freq_map_;
+    size_type     capacity_;
+    freq_type     min_freq_ = 0;
+    KeyMap        key_map_;
+    FreqMap       freq_map_;
+    lru::CacheStats stats_;
 };
 
 } // namespace lfu

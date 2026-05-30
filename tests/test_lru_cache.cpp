@@ -3,6 +3,7 @@
 #include "thread_safe_lfu_cache.hpp"
 #include "thread_safe_lru_cache.hpp"
 #include "ttl_lru_cache.hpp"
+#include "two_queue_cache.hpp"
 
 #include <cassert>
 #include <chrono>
@@ -875,6 +876,270 @@ TEST(lfu_resize_same_capacity_is_noop) {
     c.resize(3);
     EXPECT(c.size() == 2);
     EXPECT(c.capacity() == 3);
+}
+
+// ---------------------------------------------------------------------------
+// TwoQueueCache<K,V> — basic behaviour
+// ---------------------------------------------------------------------------
+
+TEST(twoq_basic_put_and_get) {
+    // capacity=8 → a1in_capacity=2, am_capacity=6; both keys fit in A1in
+    lru::TwoQueueCache<int, std::string> c(8);
+    c.put(1, "one");
+    c.put(2, "two");
+    EXPECT(c.get(1).value() == "one");
+    EXPECT(c.get(2).value() == "two");
+    EXPECT(!c.get(99).has_value());
+}
+
+TEST(twoq_capacity_zero_throws) {
+    try {
+        lru::TwoQueueCache<int, int> c(0);
+        EXPECT(false); // should not reach here
+    } catch (const std::invalid_argument&) {}
+}
+
+TEST(twoq_size_and_empty) {
+    lru::TwoQueueCache<int, int> c(4);
+    EXPECT(c.empty());
+    EXPECT(c.size() == 0);
+    c.put(1, 1);
+    EXPECT(!c.empty());
+    EXPECT(c.size() == 1);
+}
+
+TEST(twoq_contains) {
+    lru::TwoQueueCache<int, int> c(4);
+    c.put(1, 1);
+    EXPECT(c.contains(1));
+    EXPECT(!c.contains(2));
+}
+
+TEST(twoq_peek_does_not_promote) {
+    lru::TwoQueueCache<int, int> c(8); // a1in_capacity=2, both keys fit
+    c.put(1, 1); c.put(2, 2);
+    EXPECT(c.peek(1).value() == 1);
+    EXPECT(c.peek(99) == std::nullopt);
+}
+
+TEST(twoq_update_existing_in_a1in) {
+    lru::TwoQueueCache<int, int> c(4);
+    c.put(1, 10);
+    c.put(1, 20); // update within A1in
+    EXPECT(c.get(1).value() == 20);
+    EXPECT(c.size() == 1);
+}
+
+TEST(twoq_update_existing_in_am) {
+    lru::TwoQueueCache<int, int> c(4);
+    c.put(1, 10);
+    // Force promotion to Am: evict from A1in so key appears in A1out,
+    // then re-insert to trigger promotion.
+    // With capacity=4, a1in_capacity=1, a1out=3:
+    lru::TwoQueueCache<int, int> c2(4, 0.25);
+    c2.put(1, 100);          // A1in: [1]
+    c2.put(2, 200);          // A1in full → 1 demoted to A1out; A1in: [2]
+    c2.put(1, 999);          // 1 is in A1out → promote to Am with new value
+    EXPECT(c2.get(1).value() == 999);
+    c2.put(1, 777);          // now in Am → update in Am
+    EXPECT(c2.get(1).value() == 777);
+}
+
+// ---------------------------------------------------------------------------
+// TwoQueueCache — eviction and promotion
+// ---------------------------------------------------------------------------
+
+TEST(twoq_a1in_eviction_to_a1out) {
+    // capacity=4, a1in=1, am=3 → a1in full after first insert
+    lru::TwoQueueCache<int, int> c(4, 0.25);
+    c.put(1, 1); // A1in: [1]
+    c.put(2, 2); // A1in: [2], 1 demoted to A1out (value dropped)
+    EXPECT(c.get(2).has_value());
+    // 1 is in A1out (ghost only) — get() should miss
+    EXPECT(!c.get(1).has_value());
+    EXPECT(c.a1out_size() == 1);
+}
+
+TEST(twoq_promotion_from_a1out_to_am) {
+    lru::TwoQueueCache<int, int> c(4, 0.25);
+    c.put(1, 1);  // A1in: [1]
+    c.put(2, 2);  // 1 demoted to A1out; A1in: [2]
+    c.put(1, 11); // 1 in A1out → promote to Am with value 11
+    EXPECT(c.get(1).value() == 11); // now in Am
+    EXPECT(c.am_size() == 1);
+}
+
+TEST(twoq_am_eviction_when_full) {
+    // capacity=4, a1in=1, am=3
+    lru::TwoQueueCache<int, int> c(4, 0.25);
+    // Fill A1in and flush each key to A1out, then promote to Am to fill it.
+    // Keys: 10,20,30 → each put twice ends up in Am
+    // Step 1: push 10 through A1in → A1out
+    c.put(10, 10); // A1in:[10]
+    c.put(99, 0);  // A1in:[99], 10→A1out
+    c.put(10, 10); // 10 in A1out → Am:[10]
+    // Step 2: push 20
+    c.put(98, 0);  // A1in:[98], 99→A1out; Am:[10]
+    c.put(20, 20); // A1in:[20], 98→A1out; Am:[10]
+    c.put(20, 20); // 20 in A1out? 20 is still in A1in actually. Let me reconsider.
+    // Am currently has [10]; A1in has [20]; size=2
+    c.put(97, 0);  // A1in:[97], 20→A1out; size=2 (Am:[10], A1in:[97])
+    c.put(20, 20); // 20 in A1out → Am:[20,10]; size=3
+    c.put(96, 0);  // A1in:[96], 97→A1out; size=3
+    c.put(30, 30); // A1in:[30], 96→A1out; am_size=2, a1in_size=1 → size=3
+    // Force 30 to Am: another key into a1in
+    c.put(95, 0);  // 30→A1out; A1in:[95]
+    c.put(30, 30); // 30 in A1out → Am:[30,20,10]; am_size=3 (full!), a1in:[95]
+    EXPECT(c.am_size() == 3);
+    // Now push another key through to Am → should evict LRU of Am (10)
+    c.put(94, 0); // 95→A1out; A1in:[94]
+    c.put(95, 0); // 95 in A1out → Am:[95,30,20]; 10 evicted; a1in:[94]
+    EXPECT(!c.get(10).has_value()); // 10 was LRU of Am, evicted
+    EXPECT(c.get(30).has_value());
+    EXPECT(c.get(20).has_value());
+}
+
+TEST(twoq_capacity_one) {
+    lru::TwoQueueCache<int, int> c(1);
+    c.put(1, 1);
+    c.put(2, 2); // evicts 1
+    EXPECT(!c.get(1).has_value());
+    EXPECT(c.get(2).value() == 2);
+}
+
+// ---------------------------------------------------------------------------
+// TwoQueueCache — statistics
+// ---------------------------------------------------------------------------
+
+TEST(twoq_stats_hits_misses) {
+    lru::TwoQueueCache<int, int> c(4);
+    c.put(1, 1);
+    (void)c.get(1);  // hit
+    (void)c.get(99); // miss
+    EXPECT(c.stats().hits   == 1);
+    EXPECT(c.stats().misses == 1);
+    EXPECT(c.stats().puts   == 1);
+}
+
+TEST(twoq_stats_evictions) {
+    lru::TwoQueueCache<int, int> c(2, 0.5); // a1in=1, am=1
+    c.put(1, 1); // A1in:[1]
+    c.put(2, 2); // A1in:[2], 1→A1out (eviction +1)
+    c.put(3, 3); // A1in:[3], 2→A1out (eviction +1)
+    EXPECT(c.stats().evictions == 2);
+}
+
+TEST(twoq_stats_hit_rate) {
+    lru::TwoQueueCache<int, int> c(4);
+    c.put(1, 1);
+    (void)c.get(1);  // hit
+    (void)c.get(1);  // hit
+    (void)c.get(99); // miss
+    // hit_rate = 2/3
+    EXPECT(c.stats().hit_rate() > 0.66 && c.stats().hit_rate() < 0.68);
+}
+
+TEST(twoq_reset_stats) {
+    lru::TwoQueueCache<int, int> c(4);
+    c.put(1, 1);
+    (void)c.get(1);
+    (void)c.get(99);
+    c.reset_stats();
+    auto s = c.stats();
+    EXPECT(s.hits == 0 && s.misses == 0 && s.puts == 0 && s.evictions == 0);
+}
+
+TEST(twoq_stats_empty_hit_rate_is_zero) {
+    lru::TwoQueueCache<int, int> c(4);
+    EXPECT(c.stats().hit_rate() == 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// TwoQueueCache — erase and clear
+// ---------------------------------------------------------------------------
+
+TEST(twoq_erase_from_a1in) {
+    lru::TwoQueueCache<int, int> c(8); // a1in_capacity=2, both keys fit in A1in
+    c.put(1, 1); c.put(2, 2);
+    EXPECT(c.erase(1) == true);
+    EXPECT(c.erase(1) == false);
+    EXPECT(!c.get(1).has_value());
+    EXPECT(c.size() == 1);
+}
+
+TEST(twoq_erase_from_am) {
+    lru::TwoQueueCache<int, int> c(4, 0.25);
+    c.put(1, 1); // A1in:[1]
+    c.put(9, 0); // A1in:[9], 1→A1out
+    c.put(1, 1); // 1 in A1out → Am:[1]
+    EXPECT(c.erase(1) == true);
+    EXPECT(!c.get(1).has_value());
+    EXPECT(c.am_size() == 0);
+}
+
+TEST(twoq_erase_nonexistent_returns_false) {
+    lru::TwoQueueCache<int, int> c(4);
+    EXPECT(c.erase(42) == false);
+}
+
+TEST(twoq_clear) {
+    lru::TwoQueueCache<int, int> c(4);
+    c.put(1, 1); c.put(2, 2); c.put(3, 3);
+    c.clear();
+    EXPECT(c.empty());
+    EXPECT(c.size() == 0);
+    EXPECT(c.am_size() == 0);
+    EXPECT(c.a1in_size() == 0);
+    EXPECT(c.a1out_size() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// TwoQueueCache — get_or_set
+// ---------------------------------------------------------------------------
+
+TEST(twoq_get_or_set_miss_inserts) {
+    lru::TwoQueueCache<int, int> c(4);
+    int calls = 0;
+    int v = c.get_or_set(1, [&]{ ++calls; return 42; });
+    EXPECT(v == 42);
+    EXPECT(calls == 1);
+    EXPECT(c.contains(1));
+}
+
+TEST(twoq_get_or_set_hit_skips_factory) {
+    lru::TwoQueueCache<int, int> c(4);
+    c.put(1, 99);
+    int calls = 0;
+    int v = c.get_or_set(1, [&]{ ++calls; return 0; });
+    EXPECT(v == 99);
+    EXPECT(calls == 0);
+}
+
+TEST(twoq_get_or_set_miss_via_a1out_promotes_to_am) {
+    lru::TwoQueueCache<int, int> c(4, 0.25);
+    c.put(1, 1);  // A1in:[1]
+    c.put(9, 0);  // 1→A1out
+    int v = c.get_or_set(1, []{ return 55; }); // 1 in A1out → Am
+    EXPECT(v == 55);
+    EXPECT(c.am_size() == 1);
+}
+
+// ---------------------------------------------------------------------------
+// TwoQueueCache — sub-queue capacity accessors
+// ---------------------------------------------------------------------------
+
+TEST(twoq_capacity_accessors) {
+    lru::TwoQueueCache<int, int> c(8, 0.25); // a1in=2, am=6
+    EXPECT(c.capacity() == 8);
+    EXPECT(c.a1in_capacity() == 2);
+    EXPECT(c.am_capacity() == 6);
+}
+
+TEST(twoq_default_ratio_splits_correctly) {
+    // capacity=4, default ratio 0.25 → a1in=1, am=3
+    lru::TwoQueueCache<int, int> c(4);
+    EXPECT(c.a1in_capacity() == 1);
+    EXPECT(c.am_capacity() == 3);
 }
 
 // ---------------------------------------------------------------------------

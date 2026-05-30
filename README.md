@@ -1,23 +1,36 @@
 # cpp-lru-cache
 
-A high-performance, header-only cache library in modern C++17 offering two
-eviction policies — **LRU** (Least Recently Used) and **LFU** (Least
-Frequently Used) — with built-in access statistics and an optional
-thread-safe wrapper.
+A high-performance, header-only cache library in modern C++17 offering multiple
+eviction policies — **LRU**, **LFU**, **2Q (Two-Queue)**, and **TTL** — with
+built-in access statistics and optional thread-safe wrappers.
 
 ## Features
 
-- **O(1)** `get` and `put` for both LRU and LFU via doubly-linked lists + hash maps
+- **O(1)** `get` and `put` for LRU, LFU, and 2Q via doubly-linked lists + hash maps
 - **LFU** uses per-frequency buckets with LRU tie-breaking (no extra cost)
+- **TwoQueueCache** — pollution-resistant 2Q algorithm: separates "recent" from
+  "frequent" items using three sub-queues (A1in FIFO, A1out ghost, Am LRU);
+  prevents sequential-scan pollution of the hot working set
 - **Thread-safe** wrappers for LRU and LFU using `std::shared_mutex`
 - **`get_or_set(key, factory)`** — atomically returns a cached value or calls a factory to insert it; factory invoked at most once, even under concurrency
 - **`resize(n)`** — dynamically adjusts LRU cache capacity; LRU entries are evicted when shrinking
 - **`peek(key)`** — non-mutating lookup that does not update recency or statistics
-- **Built-in access statistics** — hits, misses, LRU evictions, TTL expirations, put count, hit rate; separate expiration counter on `TtlCache`
+- **Built-in access statistics** — hits, misses, evictions, TTL expirations, put count, hit rate; uniform `CacheStats` API across all variants
 - **`TtlCache`** — LRU cache with per-entry TTL; lazy expiry on access, eager `purge_expired()`, full stats API
 - Header-only, template-based — works with any hashable key and move-constructible value
-- Comprehensive unit tests (66 cases) covering edge cases and concurrent correctness
+- Comprehensive unit tests (103 cases) covering edge cases and concurrent correctness
 - Benchmark suite comparing LRU vs LFU throughput
+
+### Algorithm comparison
+
+| Variant             | Header                       | Eviction policy         | Scan-resistant | Thread-safe |
+|---------------------|------------------------------|-------------------------|:--------------:|:-----------:|
+| `lru::Cache`        | `lru_cache.hpp`              | Least Recently Used     | no             | no          |
+| `lfu::Cache`        | `lfu_cache.hpp`              | Least Frequently Used   | partial        | no          |
+| `lru::TwoQueueCache`| `two_queue_cache.hpp`        | 2Q (LRU + FIFO + ghost) | **yes**        | no          |
+| `lru::TtlCache`     | `ttl_lru_cache.hpp`          | LRU + per-entry TTL     | no             | no          |
+| `lru::ThreadSafeCache` | `thread_safe_lru_cache.hpp` | LRU (shared_mutex)     | no             | **yes**     |
+| `lfu::ThreadSafeCache` | `thread_safe_lfu_cache.hpp` | LFU (shared_mutex)     | partial        | **yes**     |
 
 ## Usage
 
@@ -96,6 +109,30 @@ cache.reset_stats(); // zero all counters
 
 Statistics are also available on `ThreadSafeCache` and `TtlCache` via the
 same `stats()` / `reset_stats()` API.
+
+### Two-Queue (2Q) Cache
+
+```cpp
+#include "two_queue_cache.hpp"
+
+// capacity=1000; A1in gets 25% (250 slots), Am gets 75% (750 slots)
+lru::TwoQueueCache<std::string, Data> cache(1000);
+
+// First access → goes to A1in (FIFO newcomer queue)
+cache.put("key1", data1);
+
+// A key that was in A1in and later evicted lands in the A1out ghost queue.
+// Re-inserting it bypasses A1in and goes directly into Am (frequent set).
+cache.put("key1", updated_data); // promoted to Am if key1 was in A1out
+
+// Custom split: 40% A1in, 60% Am
+lru::TwoQueueCache<int, int> cache2(500, 0.40);
+```
+
+**When to prefer 2Q over plain LRU:**
+- Workloads that mix a hot working set with occasional large sequential scans
+  (e.g. database full-table scans, batch ETL, log processing)
+- Any scenario where one-time accesses should not displace frequently used entries
 
 ### Thread-Safe LRU
 
